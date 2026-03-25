@@ -8,13 +8,14 @@ import requests
 app = Flask(__name__)
 message_queue = deque(maxlen=100)
 
-# 飞书配置（从环境变量读取，需要在 Railway 设置里配置）
+# 从环境变量读取飞书凭证
 FEISHU_APP_ID = os.environ.get('FEISHU_APP_ID', '')
 FEISHU_APP_SECRET = os.environ.get('FEISHU_APP_SECRET', '')
 
 def get_feishu_token():
     """获取飞书 access_token"""
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        print("[警告] 未配置飞书凭证")
         return None
     try:
         url = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
@@ -25,14 +26,17 @@ def get_feishu_token():
         data = resp.json()
         if data.get("code") == 0:
             return data.get("app_access_token")
-    except:
-        pass
+        else:
+            print(f"[获取Token失败] {data}")
+    except Exception as e:
+        print(f"获取token异常: {e}")
     return None
 
 def send_feishu_message(chat_id, text):
     """发送消息到飞书群"""
     token = get_feishu_token()
     if not token:
+        print("[发送失败] 无有效token")
         return False
     
     try:
@@ -40,19 +44,25 @@ def send_feishu_message(chat_id, text):
         headers = {"Authorization": f"Bearer {token}"}
         params = {"receive_id_type": "chat_id"}
         
-        # 构造文本消息
         content = json.dumps({"text": text})
         data = {
-            "receive_id": chat_id,
+            "receive_id": chat_id,  # 使用完整的chat_id
             "msg_type": "text",
             "content": content
         }
         
+        print(f"[发送消息] chat_id: {chat_id[:15]}... 内容: {text[:20]}...")
         resp = requests.post(url, headers=headers, params=params, json=data, timeout=10)
         result = resp.json()
-        return result.get("code") == 0
+        print(f"[飞书响应] {result}")
+        
+        if result.get("code") == 0:
+            return True
+        else:
+            print(f"[发送失败] 错误码: {result.get('code')}, 错误信息: {result.get('msg')}")
+            return False
     except Exception as e:
-        print(f"发送消息失败: {e}")
+        print(f"发送消息异常: {e}")
         return False
 
 @app.route('/', methods=['GET', 'POST'])
@@ -63,6 +73,7 @@ def webhook():
             
             # 飞书Challenge验证
             if data.get('type') == 'url_verification':
+                print(f"[Challenge验证] {data.get('challenge')}")
                 return jsonify({'challenge': data.get('challenge')})
             
             # 处理消息
@@ -90,21 +101,24 @@ def webhook():
                 else:
                     text = str(content)
                 
+                # 修复：保存完整的chat_id和sender_id，不要截断！
                 msg_info = {
                     'id': message.get('message_id'),
                     'text': text,
-                    'sender': event_data.get('sender', {}).get('sender_id', {}).get('open_id', 'unknown')[-6:],
-                    'chat': message.get('chat_id', 'unknown'),
+                    'sender': event_data.get('sender', {}).get('sender_id', {}).get('open_id', 'unknown'),  # 完整ID
+                    'chat': message.get('chat_id', 'unknown'),  # 完整ID，不截断！
                     'chat_type': message.get('chat_type', ''),
                     'time': int(time.time())
                 }
                 
                 message_queue.append(msg_info)
-                print(f"[收到] {text[:30]}...")
+                print(f"[收到消息] 群:{msg_info['chat'][:15]}... 发送者:{msg_info['sender'][:10]}... 内容:{text[:30]}...")
             
             return jsonify({'code': 0})
         except Exception as e:
             print(f"处理错误: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'code': -1, 'msg': str(e)}), 500
     
     # GET请求返回队列
@@ -118,17 +132,24 @@ def send_message():
         chat_id = data.get('chat_id')
         text = data.get('text')
         
+        print(f"[发送接口] 收到请求 chat_id:{chat_id[:20] if chat_id else 'None'}... text:{text[:20] if text else 'None'}...")
+        
         if not chat_id or not text:
             return jsonify({'code': -1, 'msg': '缺少chat_id或text'}), 400
         
-        # 发送到飞书
+        if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+            return jsonify({'code': -1, 'msg': '服务端未配置飞书凭证'}), 500
+        
         success = send_feishu_message(chat_id, text)
         
         if success:
             return jsonify({'code': 0, 'msg': '发送成功'})
         else:
-            return jsonify({'code': -1, 'msg': '发送失败'}), 500
+            return jsonify({'code': -1, 'msg': '发送失败，检查日志'}), 500
     except Exception as e:
+        print(f"发送接口异常: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'code': -1, 'msg': str(e)}), 500
 
 if __name__ == '__main__':
