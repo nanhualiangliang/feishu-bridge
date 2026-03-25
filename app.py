@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-飞书消息中转站 - 极简版
-只接收和存储消息，不处理发送（发送由本地通过 Webhook 处理）
+飞书消息中转站 - Outgoing兼容版
+同时支持：群机器人Outgoing + 应用事件订阅
 """
 
 from flask import Flask, request, jsonify
@@ -10,52 +10,77 @@ from collections import deque
 import json
 import time
 import os
+import hmac
+import hashlib
 
 app = Flask(__name__)
 
-# 内存队列（保存最近 50 条消息）
 message_queue = deque(maxlen=50)
 
-def extract_text(message):
-    """提取消息文本"""
-    content = message.get('content', '{}')
-    msg_type = message.get('message_type', '')
-    
-    try:
-        if isinstance(content, str):
-            content = json.loads(content)
-    except:
-        pass
-    
-    if msg_type == 'text':
-        return content.get('text', '')
-    elif msg_type == 'post':
-        texts = []
-        for block in content.get('content', []):
-            for elem in block:
-                if elem.get('tag') == 'text':
-                    texts.append(elem.get('text', ''))
-        return ' '.join(texts)
-    return str(content)
+# 飞书Outgoing配置的Token（用于验证，可选）
+OUTGOING_TOKEN = os.environ.get('OUTGOING_TOKEN', '')
+
+def verify_outgoing_token(data, signature):
+    """验证Outgoing请求（可选安全验证）"""
+    if not OUTGOING_TOKEN:
+        return True
+    timestamp = data.get('timestamp', '')
+    expected = hmac.new(OUTGOING_TOKEN.encode(), f"{timestamp}{json.dumps(data)}".encode(), hashlib.sha256).hexdigest()
+    return expected == signature
 
 @app.route('/', methods=['GET', 'POST'])
 def handler():
     if request.method == 'POST':
         try:
             data = request.get_json() or {}
+            print(f"[收到请求] {json.dumps(data, ensure_ascii=False)[:300]}...")
             
-            # Challenge 验证
+            # ========== 1. Challenge 验证（两种模式都需要） ==========
             if data.get('type') == 'url_verification':
                 return jsonify({'challenge': data.get('challenge')})
             
-            # 处理消息事件
+            # ========== 2. Outgoing Webhook 格式 ==========
+            # 特征：有uuid字段，数据格式扁平
+            if data.get('uuid') and data.get('event'):
+                event = data.get('event', {})
+                
+                # Outgoing直接给出text内容，不需要解析JSON
+                msg_info = {
+                    'id': event.get('message_id'),
+                    'text': event.get('text', event.get('content', '')),  # 兼容不同版本
+                    'sender': event.get('open_id', 'unknown')[-6:],
+                    'chat': event.get('open_chat_id', 'unknown')[-6:],
+                    'time': int(time.time())
+                }
+                
+                if msg_info['id']:
+                    message_queue.append(msg_info)
+                    print(f"[Outgoing存储] {msg_info['text'][:30]}... (队列: {len(message_queue)})")
+                
+                # Outgoing要求返回特定格式
+                return jsonify({'code': 0})
+            
+            # ========== 3. 应用事件订阅格式（原有逻辑） ==========
             if data.get('header', {}).get('event_type') == 'im.message.receive_v1':
                 event_data = data.get('event', {})
                 message = event_data.get('message', {})
                 
+                # 原有提取逻辑
+                content = message.get('content', '{}')
+                try:
+                    if isinstance(content, str):
+                        content = json.loads(content)
+                except:
+                    pass
+                
+                text = ''
+                msg_type = message.get('message_type', '')
+                if msg_type == 'text':
+                    text = content.get('text', '')
+                
                 msg_info = {
                     'id': message.get('message_id'),
-                    'text': extract_text(message),
+                    'text': text,
                     'sender': event_data.get('sender', {}).get('sender_id', {}).get('open_id', 'unknown')[-6:],
                     'chat': message.get('chat_id', 'unknown')[-6:],
                     'time': int(time.time())
@@ -63,15 +88,17 @@ def handler():
                 
                 if msg_info['id']:
                     message_queue.append(msg_info)
-                    print(f"[存储消息] {msg_info['text'][:30]}... (队列: {len(message_queue)})")
+                    print(f"[Event存储] {msg_info['text'][:30]}... (队列: {len(message_queue)})")
             
             return jsonify({'code': 0})
             
         except Exception as e:
             print(f"处理错误: {e}")
+            import traceback
+            print(traceback.format_exc())
             return jsonify({'code': -1, 'msg': str(e)}), 500
     
-    # GET 请求：本地客户端拉取消息
+    # GET请求：本地客户端拉取（保持原有格式不变）
     return jsonify({
         'messages': list(message_queue),
         'count': len(message_queue)
