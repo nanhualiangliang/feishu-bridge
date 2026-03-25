@@ -48,7 +48,20 @@ def handler():
             if data.get('type') == 'url_verification':
                 return jsonify({'challenge': data.get('challenge')})
             
-            # 处理消息事件
+            # 检查是否是自定义消息（来自发送端）
+            if 'id' in data and 'text' in data:
+                msg_info = {
+                    'id': data['id'],
+                    'text': data['text'],
+                    'sender': data.get('sender', 'system'),
+                    'chat': data.get('chat', 'auto'),
+                    'time': data.get('time', int(time.time()))
+                }
+                message_queue.append(msg_info)
+                print(f"[存储自定义消息] {msg_info['text'][:30]}... (队列: {len(message_queue)})")
+                return jsonify({'code': 0})
+            
+            # 处理飞书消息事件
             if data.get('header', {}).get('event_type') == 'im.message.receive_v1':
                 event_data = data.get('event', {})
                 message = event_data.get('message', {})
@@ -63,7 +76,7 @@ def handler():
                 
                 if msg_info['id']:
                     message_queue.append(msg_info)
-                    print(f"[存储消息] {msg_info['text'][:30]}... (队列: {len(message_queue)})")
+                    print(f"[存储飞书消息] {msg_info['text'][:30]}... (队列: {len(message_queue)})")
             
             return jsonify({'code': 0})
             
